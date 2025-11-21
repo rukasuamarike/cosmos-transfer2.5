@@ -18,7 +18,7 @@ from typing import Annotated, Union
 
 import pydantic
 import tyro
-from cosmos_oss.init import cleanup_environment, init_environment, init_output_dir
+from packages.cosmos_oss.init import cleanup_environment, init_environment, init_output_dir
 
 from cosmos_transfer2.config import (
     BlurConfig,
