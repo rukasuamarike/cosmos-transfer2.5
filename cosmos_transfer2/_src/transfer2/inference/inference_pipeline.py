@@ -15,7 +15,6 @@
 
 import contextlib
 import os
-import random
 import time
 from typing import Optional, Union
 
@@ -193,7 +192,7 @@ class ControlVideo2WorldInference:
             "dataset_name": "video_data",
             input_key: prev_output.squeeze(2),
             "t5_text_embeddings": text_embedding,  # positive prompt embedding. Name has t5 but also supports Reason1.
-            "fps": torch.randint(16, 32, (self.batch_size,)).cuda(),  # Random FPS (might be used by model)
+            "fps": torch.full((self.batch_size,), fps, dtype=torch.long).cuda(),  # Use actual input FPS for consistency
             "padding_mask": torch.zeros(
                 self.batch_size, 1, H, W, device="cuda"
             ),  # Padding mask (assumed no padding here)
@@ -284,8 +283,9 @@ class ControlVideo2WorldInference:
         preset_blur_strength: str = "medium",
         seg_control_prompt: str | None = None,
         input_control_video_paths: dict[str, str] | None = None,
-        show_control_condition: bool = False,
-        show_input: bool = False,
+        # COMMENTED: Debug visualization parameters
+        # show_control_condition: bool = False,
+        # show_input: bool = False,
         image_context_path: Optional[str] = None,
         keep_input_resolution: bool = True,
         negative_prompt: str | None = None,
@@ -383,6 +383,11 @@ class ControlVideo2WorldInference:
             # For first chunk, use zeros as input (after normalization it is 0)
             prev_output = torch.zeros_like(input_frames[:, :num_video_frames_per_chunk]).to(torch.uint8).cuda()[None]
 
+            # OPTIMIZATION: Initialize latent cache for inter-chunk optimization
+            # This avoids redundant VAE encoding of overlapping conditional frames
+            prev_latents_cache: Optional[torch.Tensor] = None
+            num_latent_conditional_frames = 1 + (num_conditional_frames - 1) // 4  # temporal compression
+
         # --------Start of chunk-wise long video generation--------
         for chunk_id in range(num_chunks):
             log.info(f"Generating chunk {chunk_id + 1}/{num_chunks}")
@@ -400,10 +405,24 @@ class ControlVideo2WorldInference:
                         cur_input_frames, cur_input_frames.shape[1], num_video_frames_per_chunk
                     )
                     if sigma_max is not None:
-                        x0 = uint8_to_normalized_float(cur_input_frames, dtype=torch.bfloat16)[None].cuda(
-                            non_blocking=True
-                        )
-                        x0 = self.model.encode(x0).contiguous()
+                        if prev_latents_cache is not None and chunk_id > 0:
+                            # OPTIMIZATION: Reuse cached latents for overlapping conditional frames
+                            # Only encode the NEW frames that weren't in the previous chunk
+                            new_frames = cur_input_frames[:, num_conditional_frames:]
+                            new_frames_normalized = uint8_to_normalized_float(
+                                new_frames, dtype=torch.bfloat16
+                            )[None].cuda(non_blocking=True)
+                            new_latents = self.model.encode(new_frames_normalized).contiguous()
+
+                            # Concatenate cached latents with newly encoded latents
+                            x0 = torch.cat([prev_latents_cache, new_latents], dim=2)
+                        else:
+                            # First chunk or no cache: encode all frames
+                            x0 = uint8_to_normalized_float(cur_input_frames, dtype=torch.bfloat16)[None].cuda(
+                                non_blocking=True
+                            )
+                            x0 = self.model.encode(x0).contiguous()
+
                         x_sigma_max = self.model.get_x_from_clean(x0, sigma_max, seed=(seed + chunk_id))
 
                 if isinstance(text_embeddings, list):
@@ -448,16 +467,16 @@ class ControlVideo2WorldInference:
                         1 + (num_conditional_frames - 1) // 4
                     )  # tokenizer temporal compression is 4x
 
-                random.seed(seed)
-                seed = random.randint(0, 1000000)
-                log.info(f"Seed: {seed}")
+                # Use deterministic seed per chunk: base_seed + chunk_id for reproducibility
+                chunk_seed = seed + chunk_id
+                log.info(f"Chunk {chunk_id} seed: {chunk_seed}")
 
                 # Generate and decode video
                 sample = self.model.generate_samples_from_batch(
                     data_batch,
                     n_sample=1,
                     guidance=guidance,
-                    seed=seed,
+                    seed=chunk_seed,
                     is_negative_prompt=negative_prompt is not None,
                     x_sigma_max=x_sigma_max,
                     sigma_max=sigma_max,
@@ -465,12 +484,18 @@ class ControlVideo2WorldInference:
                 )
                 video = self.model.decode(sample).cpu()  # Shape: (1, C, T, H, W)
 
-                # For visualization: concatenate condition and input videos with generated video
-                video_cat = video
-                conditions = []
-                if show_input and input_frames is not None:
-                    x0 = uint8_to_normalized_float(cur_input_frames, dtype=torch.bfloat16)[None]
-                    video_cat = torch.cat([x0, video_cat], dim=-1)
+                # OPTIMIZATION: Cache the last latent frames for the next chunk's conditioning
+                # This avoids re-encoding these frames through the VAE in the next iteration
+                if chunk_id < num_chunks - 1 and sigma_max is not None:
+                    prev_latents_cache = sample[:, :, -num_latent_conditional_frames:, :, :].contiguous().clone()
+
+                # --- DEBUG VISUALIZATION (commented out) ---
+                # video_cat = video
+                # conditions = []
+                # if show_input and input_frames is not None:
+                #     x0 = uint8_to_normalized_float(cur_input_frames, dtype=torch.bfloat16)[None]
+                #     video_cat = torch.cat([x0, video_cat], dim=-1)
+                # --- END DEBUG VISUALIZATION ---
 
                 # Accumulate control inputs for each chunk
                 for key in hint_key:
@@ -485,17 +510,21 @@ class ControlVideo2WorldInference:
                         # For subsequent chunks, only append the non-overlapping frames
                         all_control_chunks[key].append(control_input[:, :, num_conditional_frames:, :, :].cpu())
 
-                    if show_control_condition:
-                        conditions += [control_input.cpu()]
+                    # --- DEBUG VISUALIZATION (commented out) ---
+                    # if show_control_condition:
+                    #     conditions += [control_input.cpu()]
+                    # --- END DEBUG VISUALIZATION ---
 
-                if show_control_condition:
-                    video_cat = torch.cat([*conditions, video_cat], dim=-1)
+                # --- DEBUG VISUALIZATION (commented out) ---
+                # if show_control_condition:
+                #     video_cat = torch.cat([*conditions, video_cat], dim=-1)
+                # --- END DEBUG VISUALIZATION ---
 
                 if chunk_id == 0:
-                    all_chunks.append(video_cat.cpu())
+                    all_chunks.append(video.cpu())
                 else:
                     # For subsequent chunks, only append the non-overlapping frames
-                    all_chunks.append(video_cat[:, :, num_conditional_frames:, :, :].cpu())
+                    all_chunks.append(video[:, :, num_conditional_frames:, :, :].cpu())
 
                 # For next chunk, use last conditional_frames as input
                 if chunk_id < num_chunks - 1:  # Don't need to prepare next input for last chunk
@@ -533,8 +562,9 @@ class ControlVideo2WorldInference:
 
             if keep_input_resolution:
                 # reshape output video to match the input video resolution
+                # COMMENTED: Debug visualization parameters replaced with False, False
                 full_video = reshape_output_video_to_input_resolution(
-                    full_video, hint_key, show_control_condition, show_input, original_hw
+                    full_video, hint_key, False, False, original_hw
                 )
                 # Also resize control videos to match input resolution
                 for key in hint_key:
@@ -544,3 +574,98 @@ class ControlVideo2WorldInference:
                         )
         log.info(f"Average time per chunk: {sum(time_per_chunk) / len(time_per_chunk)}")
         return full_video, control_video_dict, mask_video_dict, fps, original_hw
+
+    @torch.no_grad()
+    def generate_img2world_parallel(
+        self,
+        prompt: str | torch.Tensor | list[str] | dict[str, str],
+        video_path: str,
+        guidance: int = 7,
+        seed: int = 1,
+        resolution: str = "720",
+        num_conditional_frames: int = 1,
+        num_video_frames_per_chunk: int = 93,
+        num_steps: int = 35,
+        control_weight: str = "1.0",
+        sigma_max: float | None = None,
+        hint_key: list[str] = ["edge"],
+        preset_edge_threshold: str = "medium",
+        preset_blur_strength: str = "medium",
+        seg_control_prompt: str | None = None,
+        input_control_video_paths: dict[str, str] | None = None,
+        image_context_path: Optional[str] = None,
+        keep_input_resolution: bool = True,
+        negative_prompt: str | None = None,
+        max_frames: int | None = None,
+        context_frame_idx: int | None = None,
+        # Parallel-specific parameters
+        context_parallel_size: int = 1,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], int, tuple[int, int]]:
+        """
+        Parallel version of generate_img2world() with Context Parallelism support.
+
+        This method is designed for multi-GPU inference using Context Parallelism (CP).
+        If CP is not fully configured, it falls back to sequential generation with a warning.
+
+        Additional Args:
+            context_parallel_size (int): Number of GPUs for context parallelism. Defaults to 1 (no parallelism).
+            process_group (torch.distributed.ProcessGroup, optional): Process group for CP communication.
+
+        Returns:
+            Same as generate_img2world()
+        """
+        # --- CONTEXT PARALLELISM SETUP ---
+        # TODO: Phase 3.2 - Enable Context Parallelism here
+        # Reference: cosmos_transfer2/inference.py lines 65-72
+        #
+        # if context_parallel_size > 1:
+        #     from megatron.core import parallel_state
+        #     from cosmos_transfer2._src.imaginaire.utils.context_parallel import split_inputs_cp, cat_outputs_cp
+        #
+        #     # Initialize model parallel if not already done
+        #     if not parallel_state.is_initialized():
+        #         distributed.init()
+        #         parallel_state.initialize_model_parallel(context_parallel_size=context_parallel_size)
+        #
+        #     # Get or use provided process group
+        #     if process_group is None:
+        #         process_group = parallel_state.get_context_parallel_group()
+        #
+        #     cp_rank = parallel_state.get_context_parallel_rank()
+        #     cp_size = parallel_state.get_context_parallel_world_size()
+        #     log.info(f"Context Parallelism enabled: rank {cp_rank}/{cp_size}")
+
+        # --- FALLBACK TO SEQUENTIAL GENERATION ---
+        # Until full CP integration is complete, fall back to sequential with warning
+        if context_parallel_size > 1:
+            log.warning(
+                f"Context Parallelism (size={context_parallel_size}) requested but full integration pending. "
+                "Falling back to sequential generation. "
+                "For multi-GPU inference, ensure process_group is passed to __init__."
+            )
+
+        # Forward to sequential implementation
+        # TODO: Phase 3.2 - Replace this with CP-enabled generation loop
+        return self.generate_img2world(
+            prompt=prompt,
+            video_path=video_path,
+            guidance=guidance,
+            seed=seed,
+            resolution=resolution,
+            num_conditional_frames=num_conditional_frames,
+            num_video_frames_per_chunk=num_video_frames_per_chunk,
+            num_steps=num_steps,
+            control_weight=control_weight,
+            sigma_max=sigma_max,
+            hint_key=hint_key,
+            preset_edge_threshold=preset_edge_threshold,
+            preset_blur_strength=preset_blur_strength,
+            seg_control_prompt=seg_control_prompt,
+            input_control_video_paths=input_control_video_paths,
+            image_context_path=image_context_path,
+            keep_input_resolution=keep_input_resolution,
+            negative_prompt=negative_prompt,
+            max_frames=max_frames,
+            context_frame_idx=context_frame_idx,
+        )

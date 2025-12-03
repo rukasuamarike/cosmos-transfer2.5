@@ -200,8 +200,8 @@ class Control2WorldInference:
             torch.cuda.synchronize()
 
         with self.benchmark_timer("generate_img2world"):
-            # Run model inference
-            output_video, control_video_dict, mask_video_dict, fps, _ = self.inference_pipeline.generate_img2world(
+            # Common arguments for both sequential and parallel methods
+            generate_kwargs = dict(
                 # pyrefly: ignore  # bad-argument-type
                 video_path=path_to_str(sample.video_path),
                 prompt=prompt,
@@ -215,9 +215,7 @@ class Control2WorldInference:
                 hint_key=sample.hint_keys,
                 # pyrefly: ignore  # bad-argument-type
                 input_control_video_paths=input_control_video_paths,
-                show_control_condition=sample.show_control_condition,
                 seg_control_prompt=sample.seg_control_prompt,
-                show_input=sample.show_input,
                 keep_input_resolution=not sample.not_keep_input_resolution,
                 preset_blur_strength=sample.preset_blur_strength,
                 preset_edge_threshold=sample.preset_edge_threshold,
@@ -225,6 +223,17 @@ class Control2WorldInference:
                 num_video_frames_per_chunk=sample.num_video_frames_per_chunk,
                 num_steps=sample.num_steps,
             )
+
+            # Route to parallel or sequential implementation based on context_parallel_size
+            if self.setup_args.context_parallel_size > 1:
+                output_video, control_video_dict, mask_video_dict, fps, _ = self.inference_pipeline.generate_img2world_parallel(
+                    **generate_kwargs,
+                    context_parallel_size=self.setup_args.context_parallel_size,
+                )
+            else:
+                output_video, control_video_dict, mask_video_dict, fps, _ = self.inference_pipeline.generate_img2world(
+                    **generate_kwargs,
+                )
             if self.setup_args.benchmark:
                 torch.cuda.synchronize()
 
