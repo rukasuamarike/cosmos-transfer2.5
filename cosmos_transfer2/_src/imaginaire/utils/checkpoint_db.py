@@ -90,6 +90,15 @@ class CheckpointFileHf(_CheckpointHf):
     @override
     def _download(self) -> str:
         """Download checkpoint and return the local path."""
+        # Check for local checkpoint directory first
+        checkpoint_dir = os.environ.get("CHECKPOINT_DIR")
+        if checkpoint_dir:
+            # Try path: CHECKPOINT_DIR/repository/filename (e.g., checkpoints/nvidia/Cosmos-Transfer2.5-2B/general/edge/file.pt)
+            local_path = os.path.join(checkpoint_dir, self.repository, self.filename)
+            if os.path.exists(local_path):
+                log.info(f"Using local checkpoint file: {local_path}")
+                return local_path
+
         download_kwargs = dict(
             repo_id=self.repository, repo_type="model", revision=self.revision, filename=self.filename
         )
@@ -118,6 +127,17 @@ class CheckpointDirHf(_CheckpointHf):
     @override
     def _download(self) -> str:
         """Download checkpoint and return the local path."""
+        # Check for local checkpoint directory first
+        checkpoint_dir = os.environ.get("CHECKPOINT_DIR")
+        if checkpoint_dir:
+            # Try path: CHECKPOINT_DIR/repository/subdirectory (e.g., checkpoints/nvidia/Cosmos-Reason1-7B/)
+            local_path = os.path.join(checkpoint_dir, self.repository)
+            if self.subdirectory:
+                local_path = os.path.join(local_path, self.subdirectory)
+            if os.path.exists(local_path):
+                log.info(f"Using local checkpoint directory: {local_path}")
+                return local_path
+
         patterns: dict[str, list[str]] = {}
         if self.include:
             patterns["allow_patterns"] = list(self.include)
