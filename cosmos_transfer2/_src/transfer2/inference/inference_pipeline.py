@@ -606,66 +606,295 @@ class ControlVideo2WorldInference:
         Parallel version of generate_img2world() with Context Parallelism support.
 
         This method is designed for multi-GPU inference using Context Parallelism (CP).
-        If CP is not fully configured, it falls back to sequential generation with a warning.
+        CP must be initialized via __init__ by passing process_group. The model internally
+        handles parallel attention computation via Megatron Core.
 
         Additional Args:
             context_parallel_size (int): Number of GPUs for context parallelism. Defaults to 1 (no parallelism).
             process_group (torch.distributed.ProcessGroup, optional): Process group for CP communication.
+                If None, attempts to get from Megatron parallel_state.
 
         Returns:
             Same as generate_img2world()
         """
-        # --- CONTEXT PARALLELISM SETUP ---
-        # TODO: Phase 3.2 - Enable Context Parallelism here
-        # Reference: cosmos_transfer2/inference.py lines 65-72
-        #
-        # if context_parallel_size > 1:
-        #     from megatron.core import parallel_state
-        #     from cosmos_transfer2._src.imaginaire.utils.context_parallel import split_inputs_cp, cat_outputs_cp
-        #
-        #     # Initialize model parallel if not already done
-        #     if not parallel_state.is_initialized():
-        #         distributed.init()
-        #         parallel_state.initialize_model_parallel(context_parallel_size=context_parallel_size)
-        #
-        #     # Get or use provided process group
-        #     if process_group is None:
-        #         process_group = parallel_state.get_context_parallel_group()
-        #
-        #     cp_rank = parallel_state.get_context_parallel_rank()
-        #     cp_size = parallel_state.get_context_parallel_world_size()
-        #     log.info(f"Context Parallelism enabled: rank {cp_rank}/{cp_size}")
+        # --- CONTEXT PARALLELISM DETECTION ---
+        # Check if CP is active via Megatron parallel_state
+        cp_enabled = False
+        cp_rank = 0
+        cp_size = 1
 
-        # --- FALLBACK TO SEQUENTIAL GENERATION ---
-        # Until full CP integration is complete, fall back to sequential with warning
-        if context_parallel_size > 1:
+        try:
+            from megatron.core import parallel_state
+            if parallel_state.is_initialized():
+                if process_group is None:
+                    process_group = parallel_state.get_context_parallel_group()
+                cp_rank = parallel_state.get_context_parallel_rank()
+                cp_size = parallel_state.get_context_parallel_world_size()
+                cp_enabled = cp_size > 1
+                if cp_enabled:
+                    log.info(f"Context Parallelism active: rank {cp_rank}/{cp_size}")
+        except ImportError:
+            pass
+
+        # Fallback if CP not properly configured
+        if context_parallel_size > 1 and not cp_enabled:
             log.warning(
-                f"Context Parallelism (size={context_parallel_size}) requested but full integration pending. "
+                f"Context Parallelism (size={context_parallel_size}) requested but Megatron not initialized. "
                 "Falling back to sequential generation. "
-                "For multi-GPU inference, ensure process_group is passed to __init__."
+                "Ensure process_group is passed to __init__ and model is loaded with CP enabled."
             )
 
-        # Forward to sequential implementation
-        # TODO: Phase 3.2 - Replace this with CP-enabled generation loop
-        return self.generate_img2world(
-            prompt=prompt,
-            video_path=video_path,
-            guidance=guidance,
-            seed=seed,
-            resolution=resolution,
-            num_conditional_frames=num_conditional_frames,
-            num_video_frames_per_chunk=num_video_frames_per_chunk,
-            num_steps=num_steps,
-            control_weight=control_weight,
-            sigma_max=sigma_max,
-            hint_key=hint_key,
-            preset_edge_threshold=preset_edge_threshold,
-            preset_blur_strength=preset_blur_strength,
-            seg_control_prompt=seg_control_prompt,
-            input_control_video_paths=input_control_video_paths,
-            image_context_path=image_context_path,
-            keep_input_resolution=keep_input_resolution,
-            negative_prompt=negative_prompt,
-            max_frames=max_frames,
-            context_frame_idx=context_frame_idx,
+        # If CP not enabled, forward to sequential implementation
+        if not cp_enabled:
+            return self.generate_img2world(
+                prompt=prompt,
+                video_path=video_path,
+                guidance=guidance,
+                seed=seed,
+                resolution=resolution,
+                num_conditional_frames=num_conditional_frames,
+                num_video_frames_per_chunk=num_video_frames_per_chunk,
+                num_steps=num_steps,
+                control_weight=control_weight,
+                sigma_max=sigma_max,
+                hint_key=hint_key,
+                preset_edge_threshold=preset_edge_threshold,
+                preset_blur_strength=preset_blur_strength,
+                seg_control_prompt=seg_control_prompt,
+                input_control_video_paths=input_control_video_paths,
+                image_context_path=image_context_path,
+                keep_input_resolution=keep_input_resolution,
+                negative_prompt=negative_prompt,
+                max_frames=max_frames,
+                context_frame_idx=context_frame_idx,
+            )
+
+        # --- CP-ENABLED GENERATION ---
+        # Import CP utilities (model handles output gathering internally via Megatron)
+        from cosmos_transfer2._src.imaginaire.utils.context_parallel import broadcast
+
+        # --------Input processing (rank 0 loads, then broadcast)--------
+        log.info("Loading input video...")
+        input_frames, fps, aspect_ratio, original_hw = read_and_process_video(
+            video_path, resolution=resolution, max_frames=max_frames
         )
+        if input_frames.shape[1] == 0:
+            raise ValueError("Input video is empty")
+
+        # Broadcast input frames from rank 0 to all ranks
+        input_frames = broadcast(input_frames.cuda(), process_group).cpu()
+        fps = int(broadcast(torch.tensor([fps], device="cuda"), process_group).item())
+        original_hw = (
+            int(broadcast(torch.tensor([original_hw[0]], device="cuda"), process_group).item()),
+            int(broadcast(torch.tensor([original_hw[1]], device="cuda"), process_group).item()),
+        )
+
+        # Get text context embeddings
+        log.info("Computing prompt text embeddings...")
+        with _maybe_get_timer(self.benchmark_timer, "get_text_embeddings"):
+            if self.text_encoder_class == "T5":
+                text_embeddings = get_t5_from_prompt(prompt, text_encoder_class="T5", cache_dir=self.cache_dir)
+            else:
+                text_embeddings = self.model.text_encoder.compute_text_embeddings_online(
+                    {"ai_caption": [prompt], "images": None}, input_caption_key="ai_caption"
+                )
+            # Broadcast text embeddings
+            if isinstance(text_embeddings, torch.Tensor):
+                text_embeddings = broadcast(text_embeddings.cuda(), process_group)
+            elif isinstance(text_embeddings, list):
+                text_embeddings = [broadcast(t.cuda(), process_group) for t in text_embeddings]
+
+            if negative_prompt:
+                log.info("Computing negative prompt text embeddings...")
+                if self.text_encoder_class == "T5":
+                    neg_text_embeddings = get_t5_from_prompt(
+                        negative_prompt, text_encoder_class="T5", cache_dir=self.cache_dir
+                    )
+                else:
+                    neg_text_embeddings = self.model.text_encoder.compute_text_embeddings_online(
+                        {"ai_caption": [negative_prompt], "images": None}, input_caption_key="ai_caption"
+                    )
+                self.neg_t5_embeddings = broadcast(neg_text_embeddings.cuda(), process_group)
+
+        # Process image context if provided
+        log.info("Processing image context if available...")
+        with _maybe_get_timer(self.benchmark_timer, "preprocessing"):
+            if context_frame_idx is not None:
+                image_context_path = video_path
+                log.info(f"Using context frame index: {context_frame_idx} from video path: {video_path}")
+            image_context = read_and_process_image_context(
+                image_context_path,
+                resolution=(VIDEO_RES_SIZE_INFO[resolution][aspect_ratio]),
+                resize=True,
+                context_frame_idx=context_frame_idx,
+            )
+            if image_context is not None:
+                image_context = broadcast(image_context.cuda(), process_group)
+
+            # Load control inputs
+            log.info("Loading control inputs...")
+            control_input_dict, mask_video_dict = read_and_process_control_input(
+                video_path=video_path,
+                input_control_paths=input_control_video_paths,
+                hint_key=hint_key,
+                resolution=resolution,
+                seg_control_prompt=seg_control_prompt,
+            )
+            # Broadcast control inputs
+            for k in control_input_dict:
+                control_input_dict[k] = broadcast(control_input_dict[k].cuda(), process_group).cpu()
+
+            # -------- Chunk-wise long video generation setup --------
+            num_total_frames, num_chunks, num_frames_per_chunk = self._get_num_chunks(
+                input_frames, num_video_frames_per_chunk, num_conditional_frames
+            )
+            input_frames = self._pad_input_frames(input_frames, num_total_frames, num_video_frames_per_chunk)
+            all_chunks, time_per_chunk = [], []
+            control_video_dict = {}
+            all_control_chunks = {key: [] for key in hint_key}
+            prev_output = torch.zeros_like(input_frames[:, :num_video_frames_per_chunk]).to(torch.uint8).cuda()[None]
+
+            # OPTIMIZATION: Initialize latent cache for inter-chunk optimization
+            prev_latents_cache: Optional[torch.Tensor] = None
+            num_latent_conditional_frames = 1 + (num_conditional_frames - 1) // 4
+
+        # --------Start of chunk-wise generation with CP--------
+        for chunk_id in range(num_chunks):
+            log.info(f"[CP rank {cp_rank}] Generating chunk {chunk_id + 1}/{num_chunks}")
+            with _maybe_get_timer(self.benchmark_timer, "generate_chunk"):
+                start_time = time.perf_counter()
+
+                chunk_start_frame = chunk_id * num_frames_per_chunk
+                chunk_end_frame = min(chunk_start_frame + num_video_frames_per_chunk, input_frames.shape[1])
+
+                x_sigma_max = None
+                if input_frames is not None:
+                    cur_input_frames = input_frames[:, chunk_start_frame:chunk_end_frame]
+                    cur_input_frames = self._pad_input_frames(
+                        cur_input_frames, cur_input_frames.shape[1], num_video_frames_per_chunk
+                    )
+                    if sigma_max is not None:
+                        if prev_latents_cache is not None and chunk_id > 0:
+                            new_frames = cur_input_frames[:, num_conditional_frames:]
+                            new_frames_normalized = uint8_to_normalized_float(
+                                new_frames, dtype=torch.bfloat16
+                            )[None].cuda(non_blocking=True)
+                            new_latents = self.model.encode(new_frames_normalized).contiguous()
+                            x0 = torch.cat([prev_latents_cache, new_latents], dim=2)
+                        else:
+                            x0 = uint8_to_normalized_float(cur_input_frames, dtype=torch.bfloat16)[None].cuda(
+                                non_blocking=True
+                            )
+                            x0 = self.model.encode(x0).contiguous()
+                        x_sigma_max = self.model.get_x_from_clean(x0, sigma_max, seed=(seed + chunk_id))
+
+                if isinstance(text_embeddings, list):
+                    text_emb_idx = min(chunk_id, len(text_embeddings) - 1)
+                    text_embedding = text_embeddings[text_emb_idx]
+                else:
+                    text_embedding = text_embeddings
+
+                data_batch = self._get_data_batch_input(
+                    cur_input_frames,
+                    prev_output,
+                    text_embedding,
+                    fps,
+                    negative_prompt=negative_prompt,
+                    control_weight=control_weight,
+                    image_context=image_context,
+                )
+
+                for k, v in control_input_dict.items():
+                    cur_control_input = v[:, chunk_start_frame:chunk_end_frame]
+                    data_batch[k] = self._pad_input_frames(
+                        cur_control_input, cur_control_input.shape[1], num_video_frames_per_chunk
+                    )
+                    if k == "control_input_inpaint_mask":
+                        data_batch["control_input_inpaint"] = cur_input_frames
+
+                data_batch = get_augmentor_for_eval(
+                    data_dict=data_batch,
+                    input_keys=["input_video"],
+                    output_keys=hint_key,
+                    preset_edge_threshold=preset_edge_threshold,
+                    preset_blur_strength=preset_blur_strength,
+                )
+
+                if chunk_id == 0:
+                    data_batch[NUM_CONDITIONAL_FRAMES_KEY] = 0
+                else:
+                    data_batch[NUM_CONDITIONAL_FRAMES_KEY] = 1 + (num_conditional_frames - 1) // 4
+
+                chunk_seed = seed + chunk_id
+                log.info(f"[CP rank {cp_rank}] Chunk {chunk_id} seed: {chunk_seed}")
+
+                # Generate samples - model internally uses CP for parallel attention
+                sample = self.model.generate_samples_from_batch(
+                    data_batch,
+                    n_sample=1,
+                    guidance=guidance,
+                    seed=chunk_seed,
+                    is_negative_prompt=negative_prompt is not None,
+                    x_sigma_max=x_sigma_max,
+                    sigma_max=sigma_max,
+                    num_steps=num_steps,
+                )
+
+                # Decode - tokenizer may also use CP if initialized
+                video = self.model.decode(sample).cpu()
+
+                # Cache latents for next chunk
+                if chunk_id < num_chunks - 1 and sigma_max is not None:
+                    prev_latents_cache = sample[:, :, -num_latent_conditional_frames:, :, :].contiguous().clone()
+
+                # Accumulate control inputs
+                for key in hint_key:
+                    control_input = data_batch["control_input_" + key]
+                    if f"control_input_{key}_mask" in data_batch:
+                        control_input = (control_input + 1) / 2 * data_batch[f"control_input_{key}_mask"] * 2 - 1
+                    if chunk_id == 0:
+                        all_control_chunks[key].append(control_input.cpu())
+                    else:
+                        all_control_chunks[key].append(control_input[:, :, num_conditional_frames:, :, :].cpu())
+
+                if chunk_id == 0:
+                    all_chunks.append(video.cpu())
+                else:
+                    all_chunks.append(video[:, :, num_conditional_frames:, :, :].cpu())
+
+                # Prepare next chunk input
+                if chunk_id < num_chunks - 1:
+                    last_frames = video[:, :, -num_conditional_frames:, :, :]
+                    last_frames_uint8 = normalized_float_to_uint8(last_frames)
+                    blank_frames = torch.zeros(
+                        (1, 3, num_video_frames_per_chunk - num_conditional_frames, video.shape[-2], video.shape[-1]),
+                        dtype=torch.uint8,
+                        device=video.device,
+                    )
+                    prev_output = torch.cat([last_frames_uint8, blank_frames], dim=2)
+
+                end_time = time.perf_counter()
+                time_per_chunk.append(end_time - start_time)
+
+        # --------Postprocessing--------
+        with _maybe_get_timer(self.benchmark_timer, "postprocessing"):
+            full_video = torch.cat(all_chunks, dim=2)
+            full_video = full_video[:, :, :num_total_frames, :, :]
+
+            for key in hint_key:
+                if all_control_chunks[key]:
+                    control_video_dict[key] = torch.cat(all_control_chunks[key], dim=2)
+                    control_video_dict[key] = control_video_dict[key][:, :, :num_total_frames, :, :]
+
+            if keep_input_resolution:
+                full_video = reshape_output_video_to_input_resolution(
+                    full_video, hint_key, False, False, original_hw
+                )
+                for key in hint_key:
+                    if key in control_video_dict and control_video_dict[key] is not None:
+                        control_video_dict[key] = reshape_output_video_to_input_resolution(
+                            control_video_dict[key], [key], False, False, original_hw
+                        )
+
+        log.info(f"[CP rank {cp_rank}] Average time per chunk: {sum(time_per_chunk) / len(time_per_chunk):.2f}s")
+        return full_video, control_video_dict, mask_video_dict, fps, original_hw
