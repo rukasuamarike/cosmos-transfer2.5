@@ -682,7 +682,8 @@ class ControlVideo2WorldInference:
             raise ValueError("Input video is empty")
 
         # Broadcast input frames from rank 0 to all ranks
-        input_frames = broadcast(input_frames.cuda(), process_group).cpu()
+        # Note: tensors must be contiguous for NCCL broadcast
+        input_frames = broadcast(input_frames.cuda().contiguous(), process_group).cpu()
         fps = int(broadcast(torch.tensor([fps], device="cuda"), process_group).item())
         original_hw = (
             int(broadcast(torch.tensor([original_hw[0]], device="cuda"), process_group).item()),
@@ -698,11 +699,11 @@ class ControlVideo2WorldInference:
                 text_embeddings = self.model.text_encoder.compute_text_embeddings_online(
                     {"ai_caption": [prompt], "images": None}, input_caption_key="ai_caption"
                 )
-            # Broadcast text embeddings
+            # Broadcast text embeddings (ensure contiguous for NCCL)
             if isinstance(text_embeddings, torch.Tensor):
-                text_embeddings = broadcast(text_embeddings.cuda(), process_group)
+                text_embeddings = broadcast(text_embeddings.cuda().contiguous(), process_group)
             elif isinstance(text_embeddings, list):
-                text_embeddings = [broadcast(t.cuda(), process_group) for t in text_embeddings]
+                text_embeddings = [broadcast(t.cuda().contiguous(), process_group) for t in text_embeddings]
 
             if negative_prompt:
                 log.info("Computing negative prompt text embeddings...")
@@ -714,7 +715,7 @@ class ControlVideo2WorldInference:
                     neg_text_embeddings = self.model.text_encoder.compute_text_embeddings_online(
                         {"ai_caption": [negative_prompt], "images": None}, input_caption_key="ai_caption"
                     )
-                self.neg_t5_embeddings = broadcast(neg_text_embeddings.cuda(), process_group)
+                self.neg_t5_embeddings = broadcast(neg_text_embeddings.cuda().contiguous(), process_group)
 
         # Process image context if provided
         log.info("Processing image context if available...")
@@ -729,7 +730,7 @@ class ControlVideo2WorldInference:
                 context_frame_idx=context_frame_idx,
             )
             if image_context is not None:
-                image_context = broadcast(image_context.cuda(), process_group)
+                image_context = broadcast(image_context.cuda().contiguous(), process_group)
 
             # Load control inputs
             log.info("Loading control inputs...")
@@ -740,9 +741,9 @@ class ControlVideo2WorldInference:
                 resolution=resolution,
                 seg_control_prompt=seg_control_prompt,
             )
-            # Broadcast control inputs
+            # Broadcast control inputs (ensure contiguous for NCCL)
             for k in control_input_dict:
-                control_input_dict[k] = broadcast(control_input_dict[k].cuda(), process_group).cpu()
+                control_input_dict[k] = broadcast(control_input_dict[k].cuda().contiguous(), process_group).cpu()
 
             # -------- Chunk-wise long video generation setup --------
             num_total_frames, num_chunks, num_frames_per_chunk = self._get_num_chunks(
