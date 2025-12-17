@@ -62,7 +62,7 @@ class ViewConfig(pydantic.BaseModel):
     # Autoregressive inference mode
     num_conditional_frames_per_view: int = pydantic.Field(
         default=0,
-        description="Number of frames to condition on per view. Must be one of [0, 1, 5].",
+        description="Number of video frames to condition on per view. Must be one of [0, 1, 5].",
         ge=0,
         le=5,
     )
@@ -73,7 +73,7 @@ class MultiviewInferenceArguments(CommonInferenceArguments):
 
     view_key_order: ClassVar[tuple[str, ...]] = MULTIVIEW_CAMERA_KEYS
     num_conditional_frames: int = pydantic.Field(default=1)
-    """Number of frames to condition on."""
+    """Number of video frames to condition on."""
     control_weight: Annotated[float, pydantic.Field(ge=0.0, le=1.0)] = 1.0
     """Control weight for generation."""
     front_wide: ViewConfig = pydantic.Field(default_factory=ViewConfig)
@@ -111,6 +111,9 @@ class MultiviewInferenceArguments(CommonInferenceArguments):
         default=1, description="Number of overlapping frames between consecutive chunks"
     )
     """Number of overlapping frames between consecutive chunks for temporal consistency."""
+
+    save_combined_views: bool = True
+    """Save a single concatenated video containing all views side-by-side. If False, saves individual split views and a grid view."""
 
     @pydantic.model_validator(mode="after")
     def validate_input_paths(self):
