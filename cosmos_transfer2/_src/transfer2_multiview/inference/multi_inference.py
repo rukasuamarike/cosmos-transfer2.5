@@ -710,6 +710,10 @@ def main():
 
             # Run inference
             if args.use_autoregressive:
+                # Remove num_conditional_frames from batch for autoregressive mode
+                # (it should be passed as function argument instead)
+                if NUM_CONDITIONAL_FRAMES_KEY in data_batch:
+                    del data_batch[NUM_CONDITIONAL_FRAMES_KEY]
                 # Use autoregressive generation
                 import time
 
