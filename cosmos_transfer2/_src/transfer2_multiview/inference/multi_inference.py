@@ -555,9 +555,11 @@ def main():
     os.makedirs(args.save_root, exist_ok=True)
 
     input_root = Path(args.input_root)
-    camera_dict = json.load(Path(args.view_meta))
-    view_keys = camera_dict.keys()
+    with open(args.view_meta) as f:
+        camera_dict = json.load(f)
+    view_keys = list(camera_dict.keys())
     videos_dir = input_root / "videos"
+
     control_dir = input_root / "control"
 
     # Verify required directories exist
