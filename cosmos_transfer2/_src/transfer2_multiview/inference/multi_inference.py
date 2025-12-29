@@ -141,6 +141,25 @@ from cosmos_transfer2._src.transfer2_multiview.inference.inference import Contro
 
 NUM_CONDITIONAL_FRAMES_KEY = "num_conditional_frames"
 
+
+def calculate_autoregressive_frames(chunk_size: int, chunk_overlap: int, num_chunks: int) -> int:
+    """Calculate total frames needed for autoregressive generation.
+
+    Args:
+        chunk_size: Frames per chunk (from model's state_t)
+        chunk_overlap: Overlapping frames between chunks
+        num_chunks: Number of chunks to generate
+
+    Returns:
+        Total frames needed across all chunks
+
+    Example:
+        chunk_size=93, overlap=1, num_chunks=20
+        → 93 + (93-1)*19 = 1841 frames
+    """
+    return chunk_size + (chunk_size - chunk_overlap) * (num_chunks - 1)
+
+
 # # Camera name to view index mapping
 # CAMERA_TO_VIEW_INDEX = {
 #     "camera_front_wide_120fov": 0,
@@ -172,14 +191,20 @@ DEFAULT_PROMPT = "The video captures a stunning, photorealistic scene with remar
 # shadows and provides excellent contrast for safe navigation."""
 
 
-def load_video(video_path: str, target_frames: int = 93, target_size: tuple[int, int] = (720, 1280)) -> th.Tensor:
+def load_video(
+    video_path: str,
+    target_frames: int = 93,
+    target_size: tuple[int, int] = (720, 1280),
+    allow_variable_length: bool = False
+) -> th.Tensor:
     """
     Load video and process it to target size and frame count.
 
     Args:
         video_path: Path to video file
-        target_frames: Target number of frames
+        target_frames: Target number of frames (only enforced if allow_variable_length=False)
         target_size: Target resolution (H, W)
+        allow_variable_length: If True, load all frames without padding/cropping to target_frames
 
     Returns:
         Video tensor with shape (C, T, H, W), dtype uint8
@@ -196,15 +221,18 @@ def load_video(video_path: str, target_frames: int = 93, target_size: tuple[int,
 
     C, T, H, W = video_tensor.shape
 
-    # Adjust frame count: if video is too long, take first target_frames; if too short, pad with last frame
-    if T > target_frames:
-        video_tensor = video_tensor[:, :target_frames, :, :]
-    elif T < target_frames:
-        # Pad with last frame
-        last_frame = video_tensor[:, -1:, :, :]
-        padding_frames = target_frames - T
-        last_frame_repeated = last_frame.repeat(1, padding_frames, 1, 1)
-        video_tensor = th.cat([video_tensor, last_frame_repeated], dim=1)
+    # Handle variable length mode
+    if not allow_variable_length:
+        # Original behavior: adjust to target_frames
+        if T > target_frames:
+            video_tensor = video_tensor[:, :target_frames, :, :]
+        elif T < target_frames:
+            # Pad with last frame
+            last_frame = video_tensor[:, -1:, :, :]
+            padding_frames = target_frames - T
+            last_frame_repeated = last_frame.repeat(1, padding_frames, 1, 1)
+            video_tensor = th.cat([video_tensor, last_frame_repeated], dim=1)
+    # else: keep all frames as-is for variable length mode
 
     # Convert to uint8: (C, T, H, W) -> (T, C, H, W)
     video_tensor = video_tensor.permute(1, 0, 2, 3)
@@ -253,6 +281,7 @@ def load_multiview_videos(
     target_frames: int = 93,
     target_size: tuple[int, int] = (720, 1280),
     folder_name: str = "videos",
+    allow_variable_length: bool = False,
 ) -> th.Tensor:
     """
     Load multi-view videos from a specified folder.
@@ -264,6 +293,7 @@ def load_multiview_videos(
         target_frames: Target number of frames per view
         target_size: Target resolution (H, W)
         folder_name: Name of the folder containing videos (e.g., "videos" or "control")
+        allow_variable_length: If True, load all frames without padding/cropping
 
     Returns:
         Multi-view video tensor with shape (C, V*T, H, W)
@@ -285,7 +315,7 @@ def load_multiview_videos(
             raise FileNotFoundError(f"Video not found: {video_path}")
 
         # Load single view video: (C, T, H, W)
-        video_tensor = load_video(str(video_path), target_frames, target_size)
+        video_tensor = load_video(str(video_path), target_frames, target_size, allow_variable_length=allow_variable_length)
         video_tensors.append(video_tensor)
 
     # Concatenate all views: (C, V*T, H, W)
@@ -528,29 +558,12 @@ def main():
 
     args = parse_arguments()
 
-    # Detect actual frame count from first video before model initialization
+    # Initialize directories and camera metadata
     input_root = Path(args.input_root)
     with open(args.view_meta) as f:
         camera_dict = json.load(f)
     view_keys = list(camera_dict.keys())
     videos_dir = input_root / "videos"
-
-    # Find first camera directory
-    if (videos_dir / f"{view_keys[0]}").exists():
-        first_camera_dir = videos_dir / f"{view_keys[0]}"
-    else:
-        first_camera_dir = videos_dir / view_keys[0]
-
-    # Get first video and detect frame count
-    video_files = sorted(first_camera_dir.glob("*.mp4"))
-    if len(video_files) == 0:
-        raise FileNotFoundError(f"No video files found in {first_camera_dir}")
-
-    first_video_path = video_files[0]
-    video_frames, _ = easy_io.load(str(first_video_path))
-    detected_frames = video_frames.shape[0]
-    log.info(f"Detected {detected_frames} frames from first video: {first_video_path}")
-    args.target_frames = detected_frames
 
     # Prepare experiment options
     experiment_opts = list(args.opts) if args.opts else []
@@ -575,6 +588,16 @@ def main():
     if args.context_parallel_size > 1:
         rank0 = distributed.get_rank() == 0
 
+    # Calculate chunk size from model's state_t (frames per chunk)
+    # Formula: chunk_size = 1 + (state_t - 1) * 4
+    # Example: state_t=24 → chunk_size=93 frames
+    chunk_size = vid2world_cli.model.tokenizer.get_pixel_num_frames(
+        vid2world_cli.model.config.state_t
+    )
+
+    if rank0:
+        log.info(f"Model state_t={vid2world_cli.model.config.state_t}, chunk_size={chunk_size} frames per view")
+
     # Create output directory
     os.makedirs(args.save_root, exist_ok=True)
 
@@ -585,6 +608,16 @@ def main():
     if not control_dir.exists():
         raise FileNotFoundError(f"World scenario directory not found: {control_dir}")
 
+    # Find first camera directory and get video files
+    if (videos_dir / f"{view_keys[0]}").exists():
+        first_camera_dir = videos_dir / f"{view_keys[0]}"
+    else:
+        first_camera_dir = videos_dir / view_keys[0]
+
+    video_files = sorted(first_camera_dir.glob("*.mp4"))
+    if len(video_files) == 0:
+        raise FileNotFoundError(f"No video files found in {first_camera_dir}")
+
     # Get all video IDs (from first camera directory)
     video_ids = [f.stem for f in video_files[: args.max_samples]]
     log.info(f"Found {len(video_ids)} video IDs, processing {min(len(video_ids), args.max_samples)} samples")
@@ -594,14 +627,43 @@ def main():
             log.info(f"Processing sample {i + 1}/{len(video_ids)}: {video_id}")
 
         try:
+            # NEW: Load first video to detect actual frame count
+            first_video_path = videos_dir / f"{view_keys[0]}" / f"{video_id}.mp4"
+            video_frames, _ = easy_io.load(str(first_video_path))
+            detected_frames = video_frames.shape[0]
+
+            if args.use_autoregressive:
+                # Calculate optimal num_chunks for detected frame count
+                effective_chunk_size = chunk_size - args.chunk_overlap
+                num_chunks = max(1, (detected_frames - args.chunk_overlap + effective_chunk_size - 1) // effective_chunk_size)
+                expected_frames = calculate_autoregressive_frames(chunk_size, args.chunk_overlap, num_chunks)
+
+                if rank0:
+                    log.info(f"Detected {detected_frames} frames, using {num_chunks} chunks")
+                    log.info(f"Autoregressive mode will process {expected_frames} frames")
+
+                # Use detected frame count as-is
+                target_frames = detected_frames
+            else:
+                # Non-autoregressive: must match chunk_size exactly
+                if detected_frames != chunk_size:
+                    raise ValueError(
+                        f"Non-autoregressive mode requires exactly {chunk_size} frames "
+                        f"(based on state_t={vid2world_cli.model.config.state_t}), "
+                        f"but video has {detected_frames} frames. "
+                        f"Use --use_autoregressive for longer videos or resize videos to {chunk_size} frames."
+                    )
+                target_frames = chunk_size
+
             # Load multi-view input videos
             multiview_video = load_multiview_videos(
                 input_root,
                 video_id,
                 view_keys,
-                target_frames=args.target_frames,
+                target_frames=target_frames,
                 target_size=(args.target_height, args.target_width),
                 folder_name="videos",
+                allow_variable_length=args.use_autoregressive,
             )
             if rank0:
                 log.info(f"Loaded input multiview video: {multiview_video.shape}")
@@ -611,9 +673,10 @@ def main():
                 input_root,
                 video_id,
                 view_keys,
-                target_frames=args.target_frames,
+                target_frames=target_frames,
                 target_size=(args.target_height, args.target_width),
                 folder_name="control",
+                allow_variable_length=args.use_autoregressive,
             )
             if rank0:
                 log.info(f"Loaded control video (control): {control_video.shape}")
