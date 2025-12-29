@@ -528,6 +528,30 @@ def main():
 
     args = parse_arguments()
 
+    # Detect actual frame count from first video before model initialization
+    input_root = Path(args.input_root)
+    with open(args.view_meta) as f:
+        camera_dict = json.load(f)
+    view_keys = list(camera_dict.keys())
+    videos_dir = input_root / "videos"
+
+    # Find first camera directory
+    if (videos_dir / f"{view_keys[0]}").exists():
+        first_camera_dir = videos_dir / f"{view_keys[0]}"
+    else:
+        first_camera_dir = videos_dir / view_keys[0]
+
+    # Get first video and detect frame count
+    video_files = sorted(first_camera_dir.glob("*.mp4"))
+    if len(video_files) == 0:
+        raise FileNotFoundError(f"No video files found in {first_camera_dir}")
+
+    first_video_path = video_files[0]
+    video_frames, _ = easy_io.load(str(first_video_path))
+    detected_frames = video_frames.shape[0]
+    log.info(f"Detected {detected_frames} frames from first video: {first_video_path}")
+    args.target_frames = detected_frames
+
     # Prepare experiment options
     experiment_opts = list(args.opts) if args.opts else []
     if args.use_cuda_graphs:
@@ -554,30 +578,15 @@ def main():
     # Create output directory
     os.makedirs(args.save_root, exist_ok=True)
 
-    input_root = Path(args.input_root)
-    with open(args.view_meta) as f:
-        camera_dict = json.load(f)
-    view_keys = list(camera_dict.keys())
-    videos_dir = input_root / "videos"
-
-    control_dir = input_root / "control"
-
     # Verify required directories exist
+    control_dir = input_root / "control"
     if not videos_dir.exists():
         raise FileNotFoundError(f"Videos directory not found: {videos_dir}")
     if not control_dir.exists():
         raise FileNotFoundError(f"World scenario directory not found: {control_dir}")
 
     # Get all video IDs (from first camera directory)
-
-    if (videos_dir / f"{view_keys[0]}").exists():
-        first_camera_dir = videos_dir / f"{view_keys[0]}"
-    else:
-        first_camera_dir = videos_dir / view_keys[0]
-
-    video_files = sorted(first_camera_dir.glob("*.mp4"))
     video_ids = [f.stem for f in video_files[: args.max_samples]]
-
     log.info(f"Found {len(video_ids)} video IDs, processing {min(len(video_ids), args.max_samples)} samples")
 
     for i, video_id in enumerate(video_ids):
