@@ -754,9 +754,24 @@ def main():
                 if rank0:
                     log.info("CUDA synchronized successfully after generation")
 
-                # Apply visualization layout
+                # Move to CPU before arranging to avoid GPU OOM
+                # Grid layout with large videos creates ~108GB intermediate tensors
+                if rank0:
+                    log.info("Moving tensors to CPU to avoid GPU memory issues during arrangement...")
+                video_cpu = video.cpu()
+                control_cpu = control.cpu()
+
+                if rank0:
+                    log.info(f"Moved to CPU. Freeing GPU memory...")
+                # Free GPU memory
+                del video, control
+                th.cuda.empty_cache()
+
+                # Apply visualization layout on CPU
+                if rank0:
+                    log.info(f"Arranging video on CPU (this may take a minute)...")
                 try:
-                    video_arranged = arrange_video_visualization(video, data_batch, method=args.stack_mode)
+                    video_arranged = arrange_video_visualization(video_cpu, data_batch, method=args.stack_mode)
                     if rank0:
                         log.info(f"Video arranged successfully, shape: {video_arranged.shape}")
                 except Exception as e:
@@ -764,14 +779,19 @@ def main():
                         log.error(f"Error arranging video: {e}")
                     raise
 
+                if rank0:
+                    log.info(f"Arranging control on CPU...")
                 try:
-                    control_arranged = arrange_video_visualization(control, data_batch, method=args.stack_mode)
+                    control_arranged = arrange_video_visualization(control_cpu, data_batch, method=args.stack_mode)
                     if rank0:
                         log.info(f"Control arranged successfully, shape: {control_arranged.shape}")
                 except Exception as e:
                     if rank0:
                         log.error(f"Error arranging control: {e}")
                     raise
+
+                # Free CPU memory from original tensors
+                del video_cpu, control_cpu
 
                 # Create save directory
                 if rank0:

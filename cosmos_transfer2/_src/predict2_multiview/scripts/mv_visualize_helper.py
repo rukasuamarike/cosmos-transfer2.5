@@ -50,6 +50,51 @@ VISUALIZE_LAYOUTS = {
 }
 
 
+def create_dynamic_grid_layout(view_keys):
+    """
+    Create a balanced grid layout for any number of views.
+
+    Args:
+        view_keys: List of camera view keys
+
+    Returns:
+        Layout definition (list of lists) for the grid
+    """
+    n_views = len(view_keys)
+
+    if n_views <= 3:
+        # Single row for 1-3 views
+        return [view_keys]
+    elif n_views <= 4:
+        # 2x2 grid for 4 views
+        return [view_keys[:2], view_keys[2:4]]
+    elif n_views <= 6:
+        # 2 rows, balanced
+        mid = (n_views + 1) // 2
+        return [view_keys[:mid], view_keys[mid:]]
+    elif n_views <= 9:
+        # 3x3 grid for 7-9 views
+        row_size = 3
+        rows = []
+        for i in range(0, n_views, row_size):
+            row = view_keys[i:i+row_size]
+            # Pad with None to make rows equal length
+            while len(row) < row_size:
+                row.append(None)
+            rows.append(row)
+        return rows
+    else:
+        # For more views, use 4 columns
+        row_size = 4
+        rows = []
+        for i in range(0, n_views, row_size):
+            row = view_keys[i:i+row_size]
+            while len(row) < row_size:
+                row.append(None)
+            rows.append(row)
+        return rows
+
+
 def arrange_video_visualization(mv_video, data_batch, method="width"):
     """
     Rearrange multi-view video based on specified layout method.
@@ -57,26 +102,23 @@ def arrange_video_visualization(mv_video, data_batch, method="width"):
     Args:
         mv_video: (B, C, V * T, H, W) - Multi-view video tensor
         data_batch: Batch containing camera order information
-        method: Method to arrange video visualization. Can be "width", "height", "grid", or "time".
-                - "width": Arrange all 7 views in a single horizontal row
-                - "height": Arrange all 7 views in a single vertical column
-                - "grid": Arrange views in a 3x3 grid with None values for empty positions
+        method: Method to arrange video visualization. Can be "width", "height", "grid", "grid_auto", or "time".
+                - "width": Arrange all views in a single horizontal row
+                - "height": Arrange all views in a single vertical column
+                - "grid": Arrange views in predefined 3x3 grid (requires specific camera keys)
+                - "grid_auto": Automatically create balanced grid for any views (recommended)
                 - "time": Keep original format (V*T in time dimension, no spatial rearrangement)
     Returns:
         Video tensor arranged according to the layout:
-        - For "width": (B, C, T, H, V*W) where V=7
-        - For "height": (B, C, T, V*H, W) where V=7
+        - For "width": (B, C, T, H, V*W)
+        - For "height": (B, C, T, V*H, W)
         - For "grid": (B, C, T, 3*H, 3*W) with black padding for None positions
+        - For "grid_auto": (B, C, T, rows*H, cols*W) dynamically sized
         - For "time": (B, C, V*T, H, W) (unchanged)
     """
     # Handle "time" mode - return video unchanged
     if method == "time":
         return mv_video
-
-    if method not in VISUALIZE_LAYOUTS:
-        raise ValueError(
-            f"Unsupported visualization method: {method}. Choose from {list(VISUALIZE_LAYOUTS.keys()) + ['time']}"
-        )
 
     current_view_order = data_batch["camera_keys_selection"][0]
     n_views = len(current_view_order)
@@ -93,7 +135,15 @@ def arrange_video_visualization(mv_video, data_batch, method="width"):
     black_view = th.zeros(B, C, T, H, W, dtype=video.dtype, device=video.device)
 
     # Get layout definition
-    layout_definition = VISUALIZE_LAYOUTS[method]
+    if method == "grid_auto":
+        # Dynamic layout based on actual views present
+        layout_definition = create_dynamic_grid_layout(list(current_view_order))
+    elif method in VISUALIZE_LAYOUTS:
+        layout_definition = VISUALIZE_LAYOUTS[method]
+    else:
+        raise ValueError(
+            f"Unsupported visualization method: {method}. Choose from {list(VISUALIZE_LAYOUTS.keys()) + ['grid_auto', 'time']}"
+        )
 
     # Arrange video according to layout
     grid_rows = []
