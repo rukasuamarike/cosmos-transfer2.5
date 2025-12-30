@@ -738,14 +738,45 @@ def main():
                 if rank0:
                     log.info(f"Time taken for autoregressive generation: {end_time - start_time:.2f} seconds")
 
+                if rank0:
+                    log.info(f"Video shape before unsqueeze: {video.shape}, Control shape: {control.shape}")
+
                 # Add batch dimension for saving
                 video = video.unsqueeze(0)
                 control = control.unsqueeze(0)
 
-                # Apply visualization layout
-                video_arranged = arrange_video_visualization(video, data_batch, method=args.stack_mode)
-                control_arranged = arrange_video_visualization(control, data_batch, method=args.stack_mode)
+                if rank0:
+                    log.info(f"Video shape after unsqueeze: {video.shape}, Control shape: {control.shape}")
+                    log.info(f"Starting arrange_video_visualization with stack_mode={args.stack_mode}")
 
+                # Check for CUDA errors before proceeding
+                th.cuda.synchronize()
+                if rank0:
+                    log.info("CUDA synchronized successfully after generation")
+
+                # Apply visualization layout
+                try:
+                    video_arranged = arrange_video_visualization(video, data_batch, method=args.stack_mode)
+                    if rank0:
+                        log.info(f"Video arranged successfully, shape: {video_arranged.shape}")
+                except Exception as e:
+                    if rank0:
+                        log.error(f"Error arranging video: {e}")
+                    raise
+
+                try:
+                    control_arranged = arrange_video_visualization(control, data_batch, method=args.stack_mode)
+                    if rank0:
+                        log.info(f"Control arranged successfully, shape: {control_arranged.shape}")
+                except Exception as e:
+                    if rank0:
+                        log.error(f"Error arranging control: {e}")
+                    raise
+
+                # Create save directory
+                if rank0:
+                    os.makedirs(args.save_root, exist_ok=True)
+                    log.info(f"Save directory created/verified: {args.save_root}")
                 if rank0:
                     video_path = f"{args.save_root}/inference_{video_id}_video"
                     save_img_or_video(video_arranged[0], video_path, fps=args.fps)
