@@ -368,14 +368,10 @@ class CommonInferenceArguments(pydantic.BaseModel):
                 print("Error: No inference samples", file=sys.stderr)
             sys.exit(1)
 
-        # Check if names are unique
-        names: set[str] = set()
+        # Collect batch hint keys (name uniqueness no longer enforced -
+        # multiple prompts per video_path are handled via video_X subdirectories)
         batch_hint_keys: set[str] = set()
         for obj in objs:
-            if obj.name in names:
-                print(f"Error: Inference samplename {obj.name} is not unique", file=sys.stderr)
-                sys.exit(1)
-            names.add(obj.name)
             for key in CONTROL_KEYS:
                 if getattr(obj, key, None) is not None:
                     batch_hint_keys.add(key)

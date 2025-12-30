@@ -119,10 +119,29 @@ class Control2WorldInference:
         sample_names = [sample.name for sample in samples]
         log.info(f"Generating {len(samples)} samples: {sample_names}")
 
+        # Group samples by video_path to handle multiple prompts per input
+        from collections import defaultdict
+        video_path_counts: dict[str, int] = defaultdict(int)
+        video_path_indices: dict[str, int] = defaultdict(int)
+
+        # First pass: count how many samples per video_path
+        for sample in samples:
+            video_path_counts[str(sample.video_path)] += 1
+
         output_paths: list[str] = []
         for i_sample, sample in enumerate(samples):
+            video_path_str = str(sample.video_path)
+
+            # If multiple prompts for same video, use video_X subdirectory structure
+            if video_path_counts[video_path_str] > 1:
+                idx = video_path_indices[video_path_str]
+                video_path_indices[video_path_str] += 1
+                sample_output_dir = output_dir / f"video_{idx}"
+            else:
+                sample_output_dir = output_dir
+
             log.info(f"[{i_sample + 1}/{len(samples)}] Processing sample {sample.name}")
-            output_path = self._generate_sample(sample, output_dir, sample_id=i_sample)
+            output_path = self._generate_sample(sample, sample_output_dir, sample_id=i_sample)
             if output_path is not None:
                 output_paths.append(output_path)
 
