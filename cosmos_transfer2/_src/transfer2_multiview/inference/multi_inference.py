@@ -101,7 +101,7 @@ PYTHONPATH=. torchrun --nproc_per_node=8 --master_port=12341 -m cosmos_transfer2
     --input_root /root/app/job \
     --save_root results/transfer2_multiview_480p_i2v_grid_eachview/ \
     --max_samples 5 --target_height 480 --target_width 832 \
-    --stack_mode grid  \
+    --stack_mode grid_auto  \
     --save_each_view \
     model.config.base_load_from=null
 
@@ -116,7 +116,7 @@ PYTHONPATH=. torchrun --nproc_per_node=8 --master_port=12341 -m cosmos_transfer2
     --save_root results/transfer2_multiview_480p_i2v_long_grid_eachview/ \
     --max_samples 50 --target_height 480 --target_width 832 \
     --use_autoregressive --target_frames 277 \
-    --stack_mode grid \
+    --stack_mode grid_auto \
     --save_each_view \
     model.config.base_load_from=null
 ```
@@ -495,8 +495,10 @@ def parse_arguments() -> argparse.Namespace:
         "--stack_mode",
         type=str,
         default="width",
-        choices=["height", "width", "time", "grid"],
-        help="Video stacking mode for visualization. grid will create a 3x3 grid of views.",
+        choices=["height", "width", "time", "grid", "grid_auto"],
+        help="Video stacking mode for visualization. 'width': horizontal row, 'height': vertical column, "
+             "'grid': predefined 3x3 grid (requires specific camera keys), 'grid_auto': auto-balanced grid for any views (recommended), "
+             "'time': no spatial rearrangement.",
     )
     # Video parameters
     parser.add_argument("--target_frames", type=int, default=93, help="Target number of frames per view")
