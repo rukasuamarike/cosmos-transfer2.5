@@ -164,6 +164,80 @@ def arrange_video_visualization(mv_video, data_batch, method="width"):
 
     return video
 
+def append_dynamic(
+    mv_video: th.Tensor,
+    n_views: int,
+    filenames: list[str],
+    save_dir: str,
+    fps: float = 10.0,
+) -> None:
+    """
+    Append new video chunks to existing view files.
+
+    Args:
+        mv_video: New video chunk tensor with shape (C, V*T, H, W)
+        n_views: Number of camera views
+        filenames: List of camera names/filenames (without .mp4 extension)
+        save_dir: Directory containing the existing view videos
+        fps: Frames per second for saved videos
+    """
+    from cosmos_transfer2._src.imaginaire.utils.easy_io import easy_io
+
+    C, VT, H, W = mv_video.shape
+    T = VT // n_views
+
+    # Reshape to separate views: (C, V*T, H, W) -> (C, V, T, H, W)
+    video_views = mv_video.view(C, n_views, T, H, W)
+
+    # Process each view
+    for view_idx, camera_name in enumerate(filenames):
+        new_view_video = video_views[:, view_idx, :, :, :]  # (C, T, H, W)
+        view_path = os.path.join(save_dir, f"{camera_name}.mp4")
+
+        # Check if file exists
+        if os.path.exists(view_path):
+            # Load existing video - Returns (T, H, W, C) numpy array
+            existing_frames, _ = easy_io.load(view_path)
+
+            # Concatenate existing frames with new chunk along time dimension
+            # Convert existing from (T, H, W, C) numpy to (C, T, H, W) tensor in [0, 1]
+            existing_tensor = th.from_numpy(existing_frames).permute(3, 0, 1, 2).float() / 255.0
+
+            # Combine with new frames (C, T, H, W)
+            combined_frames = th.cat([
+                existing_tensor,
+                new_view_video.cpu().float().clamp(0, 1)
+            ], dim=1)  # Concatenate on T dimension
+
+            # Save combined video
+            save_img_or_video(combined_frames, os.path.join(save_dir, camera_name), fps=fps)
+            log.info(f"Appended to view {camera_name} at {view_path}")
+        else:
+            # File doesn't exist yet, just save the new chunk
+            save_img_or_video(new_view_video, os.path.join(save_dir, camera_name), fps=fps)
+            log.info(f"Created new view {camera_name} at {view_path}")
+
+    
+def create_dynamic(
+    mv_video: th.Tensor,
+    n_views: int,
+    save_dir: str,
+    fps: float = 10.0,
+    prefix: str = "",
+) -> list[str]:
+    C, VT, H, W = mv_video.shape
+    T = VT // n_views
+    
+    camera_order = [str(n) for n in range(n_views)]
+    filenames = [f"{prefix}{camera_name}" if prefix else camera_name for camera_name in camera_order]
+    view_batch = {
+        "camera_keys_selection":[camera_order]
+    }
+    save_each_view_separately(
+        mv_video, view_batch, save_dir, fps, prefix
+    )
+
+    return filenames
 
 def save_each_view_separately(
     mv_video: th.Tensor,

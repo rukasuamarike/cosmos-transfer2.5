@@ -39,12 +39,13 @@ from typing import Optional
 import einops
 import numpy as np
 import torch
+import mediapy
 from loguru import logger
 from megatron.core import parallel_state
 
 from cosmos_transfer2._src.imaginaire.utils import distributed
 from cosmos_transfer2._src.predict2.utils.model_loader import load_model_from_checkpoint
-
+from cosmos_transfer2._src.predict2_multiview.scripts.mv_visualize_helper import create_dynamic,append_dynamic
 
 def set_seeds(seed: int, deterministic: bool = False):
     """
@@ -239,10 +240,13 @@ class ControlVideo2WorldInference:
         chunk_size: int,
         guidance: float,
         seed: int,
+        dynamic_cache_chunks: bool | None,
+        dynamic_cache_fps: int | None,
         num_conditional_frames: int | list[int],
         num_steps: int,
         use_negative_prompt: bool,
         distillation: str = "",
+        dynamic_cache_dir: str = "" | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Generate video using autoregressive sliding window approach.
@@ -258,6 +262,8 @@ class ControlVideo2WorldInference:
             num_steps: Number of sampling steps for the model.
             use_negative_prompt: Whether to use default negative prompt.
             distillation: If using distilled model, pass `dmd2`.
+            dynamic_cache_chunks: Caching to offload video chunks into files during long generation
+            dynamic_cache_dir: the directory for each view
 
         Returns:
             Tuple of (generated video tensor, control video tensor)
@@ -281,7 +287,8 @@ class ControlVideo2WorldInference:
 
         # Initialize output video list
         generated_chunks = []
-
+        # initialize dynamic cache paths
+        view_paths = []
         # Calculate number of chunks needed
         effective_chunk_size = chunk_size - overlap
         num_chunks = max(1, (frames_per_view - overlap + effective_chunk_size - 1) // effective_chunk_size)
@@ -322,13 +329,42 @@ class ControlVideo2WorldInference:
                 use_negative_prompt=use_negative_prompt,
                 distillation=distillation,
             )[0]  # C_T_H_W
-            chunk_video = einops.rearrange(chunk_video, "C (V T) H W -> V C T H W", V=n_views)
-            # Store generated chunk (remove overlap from previous chunks)
-            if chunk_idx == 0:
-                generated_chunks.append(chunk_video)
+
+            if dynamic_cache_chunks:
+                # Save chunk_video which is (C, V*T, H, W)
+                if chunk_idx == 0:
+                    view_paths = create_dynamic(
+                        chunk_video,
+                        n_views,
+                        dynamic_cache_dir,
+                        dynamic_cache_fps,
+                        "generated",
+                    )
+                else:
+                    # Remove overlap frames from chunk before appending
+                    # Rearrange to (V, C, T, H, W) to remove overlap, then back to (C, V*T, H, W)
+                    chunk_temp = einops.rearrange(chunk_video, "C (V T) H W -> V C T H W", V=n_views)
+                    chunk_no_overlap = chunk_temp[:, :, overlap:]  # Remove overlap from time dimension
+                    chunk_no_overlap = einops.rearrange(chunk_no_overlap, "V C T H W -> C (V T) H W")
+
+                    append_dynamic(
+                        chunk_no_overlap,
+                        n_views,
+                        view_paths,
+                        dynamic_cache_dir,
+                        dynamic_cache_fps,
+                    )
+
+                # Rearrange for _update_input_video_with_generated
+                chunk_video = einops.rearrange(chunk_video, "C (V T) H W -> V C T H W", V=n_views)
             else:
-                # Remove overlap frames from the beginning of this chunk
-                generated_chunks.append(chunk_video[:, :, overlap:])
+                # Store generated chunk (remove overlap from previous chunks)
+                chunk_video = einops.rearrange(chunk_video, "C (V T) H W -> V C T H W", V=n_views)
+                if chunk_idx == 0:
+                    generated_chunks.append(chunk_video)
+                else:
+                    # Remove overlap frames from the beginning of this chunk
+                    generated_chunks.append(chunk_video[:, :, overlap:])
 
             # Update input video for next iteration using generated frames
             if chunk_idx < num_chunks - 1:  # Not the last chunk
@@ -350,14 +386,37 @@ class ControlVideo2WorldInference:
                     n_views,
                     overlap_value,
                 )
+        if dynamic_cache_chunks:
+            # Load the dynamically cached generated videos
+            view_tensors = []
+            for video_filename in view_paths:
+                # Construct full path to the video file
+                video_path = os.path.join(dynamic_cache_dir, f"{video_filename}.mp4")
 
-        # Concatenate all chunks along time dimension
-        final_video = torch.cat(generated_chunks, dim=2)
+                # Load video: mediapy.read_video returns (T, H, W, C) uint8 numpy array
+                video_np = mediapy.read_video(video_path)
 
-        # Return the corresponding control video for the same time range, between 0 and 1
-        final_control = einops.rearrange(full_control[0].float() / 255.0, "C (V T) H W -> V C T H W", V=n_views)[
-            :, :, : final_video.shape[2]
-        ]
+                # Convert to tensor and rearrange: (T, H, W, C) -> (C, T, H, W) in [0, 1]
+                video_t = torch.from_numpy(video_np).permute(3, 0, 1, 2).float() / 255.0
+
+                # Add view dimension: (C, T, H, W) -> (1, C, T, H, W)
+                view_tensors.append(video_t.unsqueeze(0))
+
+            # Stack all views: list of (1, C, T, H, W) -> (V, C, T, H, W)
+            final_video = torch.cat(view_tensors, dim=0)
+
+            # Return the corresponding control video for the same time range, between 0 and 1
+            final_control = einops.rearrange(full_control[0].float() / 255.0, "C (V T) H W -> V C T H W", V=n_views)[
+                :, :, : final_video.shape[2]
+            ]
+        else:
+            # Concatenate all chunks along time dimension
+            final_video = torch.cat(generated_chunks, dim=2)
+
+            # Return the corresponding control video for the same time range, between 0 and 1
+            final_control = einops.rearrange(full_control[0].float() / 255.0, "C (V T) H W -> V C T H W", V=n_views)[
+                :, :, : final_video.shape[2]
+            ]
 
         final_video = einops.rearrange(final_video, "V C T H W -> C (V T) H W")
         final_control = einops.rearrange(final_control, "V C T H W -> C (V T) H W")

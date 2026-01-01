@@ -530,6 +530,11 @@ def parse_arguments() -> argparse.Namespace:
         help="Use autoregressive generation for long videos",
     )
     parser.add_argument(
+        "--use_cache_offload",
+        action="store_true",
+        help="Use generation caches for long videos",
+    )
+    parser.add_argument(
         "--chunk_overlap",
         type=int,
         default=1,
@@ -733,6 +738,9 @@ def main():
                     chunk_overlap=args.chunk_overlap,
                     use_negative_prompt=args.use_negative_prompt,
                     distillation=args.distillation,
+                    dynamic_cache_chunks=args.use_cache_offload,
+                    dynamic_cache_fps=args.fps,
+                    dynamic_cache_dir=args.save_root
                 )
 
                 th.cuda.synchronize()
