@@ -726,7 +726,7 @@ def main():
 
                 th.cuda.synchronize()
                 start_time = time.time()
-
+                os.makedirs(args.save_root, exist_ok=True)
                 video, control = vid2world_cli.generate_autoregressive_from_batch(
                     data_batch,
                     guidance=args.guidance,
