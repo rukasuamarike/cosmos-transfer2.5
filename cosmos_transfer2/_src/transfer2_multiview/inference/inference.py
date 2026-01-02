@@ -45,7 +45,7 @@ from megatron.core import parallel_state
 
 from cosmos_transfer2._src.imaginaire.utils import distributed
 from cosmos_transfer2._src.predict2.utils.model_loader import load_model_from_checkpoint
-from cosmos_transfer2._src.predict2_multiview.scripts.mv_visualize_helper import create_dynamic,append_dynamic
+from cosmos_transfer2._src.predict2_multiview.scripts.mv_visualize_helper import create_dynamic, append_dynamic
 
 def set_seeds(seed: int, deterministic: bool = False):
     """
@@ -246,7 +246,7 @@ class ControlVideo2WorldInference:
         num_steps: int,
         use_negative_prompt: bool,
         distillation: str = "",
-        dynamic_cache_dir: str = "" | None,
+        dynamic_cache_dir: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Generate video using autoregressive sliding window approach.
